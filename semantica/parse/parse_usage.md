@@ -477,6 +477,20 @@ print(f"Text: {ocr_result.text}")
 print(f"Confidence: {ocr_result.confidence}")
 ```
 
+`ImageParser` only opens PNG, JPEG, WebP and BMP by default, and rejects
+files over 50 MB or `PIL.Image.MAX_IMAGE_PIXELS` pixels. The format is
+detected from the file contents, not the extension. TIFF and GIF must be
+enabled explicitly, because their Pillow decoders have open advisories
+(#2067). EPS can't be enabled.
+
+```python
+image_parser = ImageParser(
+    allowed_formats=["PNG", "JPEG", "TIFF"],
+    max_file_size=20 * 1024 * 1024,  # bytes
+    max_pixels=50_000_000,
+)
+```
+
 ### Media File Parsing
 
 ```python

@@ -7,7 +7,9 @@ and image analysis, including metadata extraction and OCR processing.
 Key Features:
     - Image metadata extraction (EXIF, format, size)
     - OCR text extraction using Tesseract
-    - Image format support (JPEG, PNG, GIF, BMP, TIFF)
+    - Image format support (PNG, JPEG, WebP, BMP by default; TIFF and GIF
+      opt-in via the allowed_formats config)
+    - File size and pixel count limits on untrusted input
     - Image analysis and properties
     - Optional Tesseract OCR integration
     - PIL/Pillow integration
@@ -32,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, UnidentifiedImageError
 from PIL.Image import Image as PILImage
 
 from ..utils.exceptions import ProcessingError, ValidationError
@@ -42,6 +44,17 @@ from ..utils.progress_tracker import get_progress_tracker
 from ..utils.helpers import safe_import
 
 pytesseract, TESSERACT_AVAILABLE = safe_import("pytesseract")
+
+# Pillow formats opened by default. The TIFF and GIF decoders carry open
+# pillow 12.3.0 advisories that can't be fixed until docling allows pillow 13
+# (#2067), so callers that need them opt in through `allowed_formats`.
+DEFAULT_ALLOWED_FORMATS = ("PNG", "JPEG", "WEBP", "BMP")
+
+# Never opened, even when requested: Pillow renders EPS by running
+# Ghostscript on the file.
+BLOCKED_FORMATS = frozenset({"EPS"})
+
+DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024  # bytes
 
 
 @dataclass
@@ -75,7 +88,15 @@ class ImageParser:
         Initialize image parser.
 
         Args:
-            **config: Parser configuration
+            **config: Parser configuration:
+                - tesseract_path: Path to the tesseract binary
+                - allowed_formats: Pillow format names to accept
+                  (default: PNG, JPEG, WEBP, BMP). Add "TIFF" or "GIF" to
+                  accept those; "EPS" is always refused.
+                - max_file_size: Largest file accepted, in bytes
+                  (default: 50 MB)
+                - max_pixels: Largest width * height accepted
+                  (default: PIL.Image.MAX_IMAGE_PIXELS)
         """
         self.logger = get_logger("image_parser")
         self.config = config
@@ -83,6 +104,68 @@ class ImageParser:
         self.tesseract_path = config.get("tesseract_path")
         if self.tesseract_path:
             pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+
+        self.allowed_formats = tuple(
+            fmt.upper()
+            for fmt in config.get("allowed_formats", DEFAULT_ALLOWED_FORMATS)
+        )
+        blocked = BLOCKED_FORMATS.intersection(self.allowed_formats)
+        if blocked:
+            raise ValidationError(
+                f"Image formats {sorted(blocked)} cannot be enabled: Pillow "
+                "decodes them by running external tools on the file."
+            )
+        self.max_file_size = config.get("max_file_size", DEFAULT_MAX_FILE_SIZE)
+        self.max_pixels = config.get("max_pixels", Image.MAX_IMAGE_PIXELS)
+
+    def _open_image(self, file_path: Path) -> PILImage:
+        """
+        Open an image with the format, file size and pixel limits applied.
+
+        Every Pillow decode in this class goes through here, so untrusted
+        files only ever reach the decoders for allowed formats.
+
+        Args:
+            file_path: Path to image file
+
+        Returns:
+            PILImage: The opened (lazily decoded) image
+
+        Raises:
+            ValidationError: If the file is missing, too large, in a format
+                that is not allowed, or has too many pixels
+        """
+        if not file_path.exists():
+            raise ValidationError(f"Image file not found: {file_path}")
+
+        file_size = file_path.stat().st_size
+        if self.max_file_size is not None and file_size > self.max_file_size:
+            raise ValidationError(
+                f"Image file is {file_size} bytes, over the {self.max_file_size} "
+                f"byte limit: {file_path}"
+            )
+
+        try:
+            img = Image.open(file_path, formats=self.allowed_formats)
+        except UnidentifiedImageError:
+            raise ValidationError(
+                f"Not an image in an allowed format ({', '.join(self.allowed_formats)}): "
+                f"{file_path}"
+            )
+        except Image.DecompressionBombError as e:
+            raise ValidationError(f"Image exceeds the pixel limit: {e}")
+
+        # Image.open only reads the header, so the size is known before any
+        # pixel data is decoded.
+        pixels = img.width * img.height
+        if self.max_pixels is not None and pixels > self.max_pixels:
+            img.close()
+            raise ValidationError(
+                f"Image has {pixels} pixels, over the {self.max_pixels} pixel "
+                f"limit: {file_path}"
+            )
+
+        return img
 
     def parse(self, file_path: Union[str, Path], **options) -> Dict[str, Any]:
         """
@@ -114,13 +197,15 @@ class ImageParser:
 
             # Validate image file
             try:
-                with Image.open(file_path) as img:
+                with self._open_image(file_path) as img:
                     img.verify()
+            except ValidationError:
+                raise
             except Exception as e:
                 raise ValidationError(f"Invalid image file: {e}")
 
             try:
-                with Image.open(file_path) as img:
+                with self._open_image(file_path) as img:
                     # Extract metadata
                     metadata = None
                     if options.get("extract_metadata", True):
@@ -184,17 +269,19 @@ class ImageParser:
 
         file_path = Path(file_path)
 
-        if not file_path.exists():
-            raise ValidationError(f"Image file not found: {file_path}")
+        # pytesseract opens a path with Pillow itself, so hand it an image
+        # that has already passed the limits instead.
+        img = self._open_image(file_path)
 
         try:
-            # Extract text
-            text = pytesseract.image_to_string(str(file_path), lang=language)
+            with img:
+                # Extract text
+                text = pytesseract.image_to_string(img, lang=language)
 
-            # Get detailed data with boxes
-            data = pytesseract.image_to_data(
-                str(file_path), lang=language, output_type=pytesseract.Output.DICT
-            )
+                # Get detailed data with boxes
+                data = pytesseract.image_to_data(
+                    img, lang=language, output_type=pytesseract.Output.DICT
+                )
 
             # Calculate average confidence
             confidences = [conf for conf in data["conf"] if conf != -1]
@@ -239,32 +326,44 @@ class ImageParser:
         """
         file_path = Path(file_path)
 
-        if not file_path.exists():
-            raise ValidationError(f"Image file not found: {file_path}")
+        img = self._open_image(file_path)
 
         try:
-            with Image.open(file_path) as img:
-                # Extract EXIF data
-                exif_data = {}
-                if hasattr(img, "_getexif") and img._getexif():
-                    exif_dict = img._getexif()
-                    for tag_id, value in exif_dict.items():
-                        tag = ExifTags.TAGS.get(tag_id, tag_id)
-                        exif_data[str(tag)] = str(value)
-
-                return ImageMetadata(
-                    format=img.format,
-                    mode=img.mode,
-                    size=img.size,
-                    width=img.width,
-                    height=img.height,
-                    exif=exif_data,
-                    info=img.info or {},
-                )
+            with img:
+                return self._extract_metadata(img, file_path)
 
         except Exception as e:
             self.logger.error(f"Failed to extract metadata from image {file_path}: {e}")
             raise ProcessingError(f"Failed to extract metadata from image: {e}")
+
+    def _extract_metadata(self, img: PILImage, file_path: Path) -> ImageMetadata:
+        """
+        Extract metadata from an already opened image.
+
+        Args:
+            img: Opened image
+            file_path: Path the image was opened from
+
+        Returns:
+            ImageMetadata: Image metadata
+        """
+        # Extract EXIF data
+        exif_data = {}
+        if hasattr(img, "_getexif") and img._getexif():
+            exif_dict = img._getexif()
+            for tag_id, value in exif_dict.items():
+                tag = ExifTags.TAGS.get(tag_id, tag_id)
+                exif_data[str(tag)] = str(value)
+
+        return ImageMetadata(
+            format=img.format,
+            mode=img.mode,
+            size=img.size,
+            width=img.width,
+            height=img.height,
+            exif=exif_data,
+            info=img.info or {},
+        )
 
     def preprocess_image(self, file_path: Union[str, Path], **options) -> Path:
         """
@@ -282,7 +381,7 @@ class ImageParser:
         """
         file_path = Path(file_path)
 
-        with Image.open(file_path) as img:
+        with self._open_image(file_path) as img:
             # Convert to grayscale if requested
             if options.get("grayscale", True):
                 img = img.convert("L")
