@@ -33,7 +33,6 @@ License: MIT
 import io
 import os
 import stat
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -63,6 +62,13 @@ BLOCKED_FORMATS = frozenset({"EPS"})
 FORMAT_ALIASES = {"JPG": "JPEG", "TIF": "TIFF", "MPO": "JPEG"}
 
 DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024  # bytes
+
+# Image modes Pillow's PNG encoder can write.
+PNG_MODES = frozenset({"1", "L", "LA", "I", "I;16", "I;16B", "P", "RGB", "RGBA"})
+
+# Pillow's own default for Image.MAX_IMAGE_PIXELS, used when an application
+# has set that to None to disable Pillow's check.
+DEFAULT_MAX_PIXELS = 89_478_485
 
 
 def _webp_canvas_size(data: bytes) -> Optional[tuple]:
@@ -102,6 +108,34 @@ def _webp_canvas_size(data: bytes) -> Optional[tuple]:
         bits = int.from_bytes(data[21:25], "little")
         return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
     return None
+
+
+def _ocr_copy(img: PILImage) -> PILImage:
+    """
+    Make the RGB copy that is handed to tesseract.
+
+    A plain convert("RGB") loses text in two common cases: it clips 16- and
+    32-bit grayscale to white instead of scaling it, and it drops alpha, so
+    dark text on a transparent dark background turns solid black.
+
+    Args:
+        img: Opened image
+
+    Returns:
+        PILImage: An RGB copy with no format set
+    """
+    if img.mode == "I" or img.mode.startswith("I;16"):
+        img = img.point(lambda value: value / 256).convert("L")
+
+    has_alpha = "A" in img.getbands()
+    if has_alpha or (img.mode == "P" and "transparency" in img.info):
+        # Flatten onto white, as pytesseract does for images with alpha.
+        rgba = img.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, (0, 0), rgba.getchannel("A"))
+        return background
+
+    return img.convert("RGB")
 
 
 @dataclass
@@ -145,9 +179,13 @@ class ImageParser:
                 - max_file_size: Largest file accepted, in bytes
                   (default: 50 MB; None for no limit)
                 - max_pixels: Largest width * height accepted
-                  (default: PIL.Image.MAX_IMAGE_PIXELS). Pillow refuses
-                  anything over twice that on its own, so it can't be raised
-                  past that cap.
+                  (default: PIL.Image.MAX_IMAGE_PIXELS, or 89,478,485 if
+                  that is None). Pillow refuses anything over twice
+                  MAX_IMAGE_PIXELS on its own, so it can't be raised past
+                  that cap, and between 1x and 2x Pillow still emits its
+                  DecompressionBombWarning. Lower it on memory-constrained
+                  hosts: OCR and preprocessing decode the full image, and a
+                  WebP at the default limit can take about 2 GB.
         """
         self.logger = get_logger("image_parser")
         self.config = config
@@ -161,11 +199,13 @@ class ImageParser:
         )
         self.max_file_size = config.get("max_file_size", DEFAULT_MAX_FILE_SIZE)
         if self.max_file_size is not None and (
-            not isinstance(self.max_file_size, int) or self.max_file_size < 1
+            not isinstance(self.max_file_size, int)
+            or isinstance(self.max_file_size, bool)
+            or self.max_file_size < 1
         ):
             raise ValidationError("max_file_size must be a positive int or None")
         self.max_pixels = self._validate_max_pixels(
-            config.get("max_pixels", Image.MAX_IMAGE_PIXELS)
+            config.get("max_pixels", Image.MAX_IMAGE_PIXELS or DEFAULT_MAX_PIXELS)
         )
 
     @staticmethod
@@ -187,6 +227,9 @@ class ImageParser:
                 "allowed_formats must be a list of format names, "
                 f'such as ["PNG", "JPEG"], not {formats!r}'
             )
+        if isinstance(formats, set):
+            # A set has no order; sort so Pillow tries formats predictably.
+            formats = sorted(formats, key=str)
         names = tuple(
             FORMAT_ALIASES.get(str(fmt).upper(), str(fmt).upper()) for fmt in formats
         )
@@ -201,7 +244,8 @@ class ImageParser:
             )
 
         # Registers every plugin Pillow has, so Image.OPEN is complete. A
-        # format missing here (e.g. WEBP without libwebp) can't be opened.
+        # format can be registered but still unusable (WEBP without
+        # libwebp); such files are then refused as unidentified at open.
         Image.init()
         unknown = [name for name in names if name not in Image.OPEN]
         if unknown:
@@ -222,7 +266,11 @@ class ImageParser:
         Returns:
             int: The validated limit
         """
-        if not isinstance(max_pixels, int) or max_pixels < 1:
+        if (
+            not isinstance(max_pixels, int)
+            or isinstance(max_pixels, bool)
+            or max_pixels < 1
+        ):
             raise ValidationError("max_pixels must be a positive int")
         if (
             Image.MAX_IMAGE_PIXELS is not None
@@ -264,11 +312,7 @@ class ImageParser:
             self._check_pixels(size, file_path)
 
         try:
-            # Our own pixel check below replaces Pillow's warning, which would
-            # otherwise surface as an exception under -W error.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
-                img = Image.open(io.BytesIO(data), formats=self.allowed_formats)
+            img = Image.open(io.BytesIO(data), formats=self.allowed_formats)
         except UnidentifiedImageError:
             raise ValidationError(
                 f"Not a supported image, or a damaged one: {file_path}. "
@@ -276,7 +320,10 @@ class ImageParser:
                 "TIFF or GIF, add them to allowed_formats, e.g. ImageParser("
                 'allowed_formats=["PNG", "JPEG", "WEBP", "BMP", "TIFF"]).'
             )
-        except Image.DecompressionBombError as e:
+        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+            # The warning only arrives as an exception when warnings are
+            # errors (-W error). It isn't suppressed with catch_warnings(),
+            # which changes process-wide state and isn't thread-safe.
             raise ValidationError(f"Image exceeds the pixel limit: {e}")
 
         try:
@@ -312,6 +359,11 @@ class ImageParser:
             raise ValidationError(f"Image file not found: {file_path}")
         except IsADirectoryError:
             raise ValidationError(f"Not a regular file: {file_path}")
+        except PermissionError:
+            # Windows reports a directory as EACCES rather than EISDIR.
+            if os.path.isdir(file_path):
+                raise ValidationError(f"Not a regular file: {file_path}")
+            raise
 
         # Checked on the open descriptor, so the path can't be swapped for a
         # FIFO, device or directory after the check.
@@ -462,7 +514,7 @@ class ImageParser:
             # copy instead: with no format set, pytesseract writes it out as
             # PNG, which also covers MPO JPEGs (pytesseract rejects that
             # format) and keeps the TIFF and GIF encoders off the OCR path.
-            with self._open_image(file_path) as img, img.convert("RGB") as ocr_img:
+            with self._open_image(file_path) as img, _ocr_copy(img) as ocr_img:
                 # Extract text
                 text = pytesseract.image_to_string(ocr_img, lang=language)
 
@@ -567,7 +619,9 @@ class ImageParser:
 
         Returns:
             Path: Path to the preprocessed image, always written as PNG
-                (<name>_preprocessed.png next to the input)
+                (<stem>_preprocessed.png next to the input). Inputs that
+                differ only by extension, such as a.png and a.jpg, share an
+                output path, so the later call overwrites the earlier one.
         """
         file_path = Path(file_path)
 
@@ -598,6 +652,9 @@ class ImageParser:
                 # encoder from the extension would let a file named .tiff or
                 # .gif reach the TIFF or GIF encoder.
                 output_path = file_path.parent / f"{file_path.stem}_preprocessed.png"
+                # PNG can't store modes such as CMYK (JPEG) or YCbCr.
+                if img.mode not in PNG_MODES:
+                    img = img.convert("RGB")
                 img.save(output_path, format="PNG")
 
                 return output_path

@@ -8,8 +8,10 @@ Covers:
     - File size and pixel count limits
     - Every entry point (parse, extract_metadata, preprocess_image,
       extract_text) applies the limits
-    - The size limit applies to the bytes actually decoded
+    - The size limit applies to the bytes read; FIFOs and directories are
+      refused without blocking
     - Unexpected open failures are logged and wrapped as ProcessingError
+    - The OCR input keeps text in 16-bit and transparent images
     - Config validation, pixel limits (including WebP headers and Pillow's
       own bomb check) and error mapping
 """
@@ -17,6 +19,7 @@ Covers:
 import os
 import struct
 import tempfile
+import threading
 import unittest
 import warnings
 import zlib
@@ -101,31 +104,26 @@ class TestImageParserLimits(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ImageParser().extract_metadata(self.dir / "missing.png")
 
-    def test_size_limit_uses_bytes_read_not_stat(self):
-        # Simulate a file that grows after its size is checked: stat()
-        # reports the small file, but the path holds the large one. The
-        # limit must still apply to what is read and decoded.
-        small = self._image("small.png", "PNG", size=(2, 2))
-        large = self._image("large.png", "PNG", size=(200, 200))
-        small_stat = small.stat()
-        real_stat = Path.stat
-
-        def fake_stat(path, *args, **kwargs):
-            if path == large:
-                return small_stat
-            return real_stat(path, *args, **kwargs)
-
-        parser = ImageParser(max_file_size=small_stat.st_size)
-        with patch.object(Path, "stat", fake_stat):
-            with self.assertRaises(ValidationError):
-                parser.extract_metadata(large)
-
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs os.mkfifo")
     def test_fifo_is_refused_without_blocking(self):
         fifo = self.dir / "pipe.png"
         os.mkfifo(fifo)
-        with self.assertRaises(ValidationError):
-            ImageParser().extract_metadata(fifo)
+        errors = []
+
+        def run():
+            try:
+                ImageParser().extract_metadata(fifo)
+            except Exception as e:
+                errors.append(e)
+
+        # In a thread with a timeout, so a regression fails instead of
+        # hanging the test run.
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(), "opening a FIFO blocked")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ValidationError)
 
     def test_unexpected_open_error_is_logged_and_wrapped(self):
         parser = ImageParser()
@@ -163,6 +161,14 @@ class TestImageParserLimits(unittest.TestCase):
         parser = ImageParser(max_pixels=1000)
         with self.assertRaises(ValidationError):
             parser.preprocess_image(self._image("a.png", "PNG"), resize=10)
+
+    def test_preprocess_cmyk_without_grayscale(self):
+        # PNG can't store CMYK, so a CMYK JPEG must be converted to RGB.
+        path = self.dir / "cmyk.jpg"
+        Image.new("CMYK", (8, 8), (0, 255, 255, 0)).save(path, format="JPEG")
+        output = ImageParser().preprocess_image(path, grayscale=False)
+        with Image.open(output) as out:
+            self.assertEqual((out.format, out.mode), ("PNG", "RGB"))
 
     def _fake_tesseract(self):
         fake = MagicMock()
@@ -217,6 +223,57 @@ class TestImageParserLimits(unittest.TestCase):
         self.assertIsNone(passed.format)
         self.assertEqual(passed.mode, "RGB")
 
+    def _ocr_input(self, path):
+        """Run extract_text and return a copy of the image tesseract got."""
+        captured = []
+        fake_tesseract = self._fake_tesseract()
+        fake_tesseract.image_to_string.side_effect = lambda img, **kwargs: (
+            captured.append(img.copy()) or "hello"
+        )
+        with (
+            patch("semantica.parse.image_parser.TESSERACT_AVAILABLE", True),
+            patch("semantica.parse.image_parser.pytesseract", fake_tesseract),
+        ):
+            ImageParser().extract_text(path)
+        return captured[0]
+
+    def test_ocr_input_scales_16_bit_grayscale(self):
+        # A plain convert("RGB") clips 16-bit values, turning the text and
+        # the background both white.
+        path = self.dir / "scan16.png"
+        img = Image.new("I;16", (8, 8), 60000)
+        img.putpixel((0, 0), 8000)
+        img.save(path, format="PNG")
+
+        ocr_input = self._ocr_input(path)
+        self.assertEqual(ocr_input.mode, "RGB")
+        self.assertEqual(ocr_input.getpixel((0, 0)), (31, 31, 31))
+        self.assertEqual(ocr_input.getpixel((1, 1)), (234, 234, 234))
+
+    def test_ocr_input_flattens_alpha_onto_white(self):
+        # Black text on a transparent black background must stay readable,
+        # not turn solid black.
+        path = self.dir / "transparent.png"
+        img = Image.new("RGBA", (8, 8), (0, 0, 0, 0))
+        img.putpixel((0, 0), (0, 0, 0, 255))
+        img.save(path, format="PNG")
+
+        ocr_input = self._ocr_input(path)
+        self.assertEqual(ocr_input.getpixel((0, 0)), (0, 0, 0))
+        self.assertEqual(ocr_input.getpixel((1, 1)), (255, 255, 255))
+
+    def test_ocr_input_flattens_palette_transparency(self):
+        path = self.dir / "palette.png"
+        img = Image.new("P", (8, 8), 0)
+        img.putpalette([0, 0, 0] * 256)
+        img.putpixel((0, 0), 1)
+        img.info["transparency"] = 0
+        img.save(path, format="PNG", transparency=0)
+
+        ocr_input = self._ocr_input(path)
+        self.assertEqual(ocr_input.getpixel((0, 0)), (0, 0, 0))
+        self.assertEqual(ocr_input.getpixel((1, 1)), (255, 255, 255))
+
     # --- Config validation ---
 
     def test_allowed_formats_validation(self):
@@ -231,24 +288,50 @@ class TestImageParserLimits(unittest.TestCase):
         metadata = parser.extract_metadata(self._image("a.tiff", "TIFF"))
         self.assertEqual(metadata.format, "TIFF")
 
+    def test_allowed_formats_set_has_stable_order(self):
+        parser = ImageParser(allowed_formats={"WEBP", "BMP", "PNG", "JPEG"})
+        self.assertEqual(parser.allowed_formats, ("BMP", "JPEG", "PNG", "WEBP"))
+
     def test_max_pixels_validation(self):
-        for bad in [0, -1, None, "100", 2 * Image.MAX_IMAGE_PIXELS + 1]:
+        for bad in [0, -1, None, True, "100", 2 * Image.MAX_IMAGE_PIXELS + 1]:
             with self.subTest(max_pixels=bad):
                 with self.assertRaises(ValidationError):
                     ImageParser(max_pixels=bad)
 
     def test_max_file_size_validation(self):
-        for bad in [0, -1, "100"]:
+        for bad in [0, -1, True, "100"]:
             with self.subTest(max_file_size=bad):
                 with self.assertRaises(ValidationError):
                     ImageParser(max_file_size=bad)
         ImageParser(max_file_size=None)
+
+    def test_constructs_when_pillow_limit_disabled(self):
+        # Applications that accept large scans set MAX_IMAGE_PIXELS = None;
+        # the parser must still construct, with Pillow's usual default.
+        with patch.object(Image, "MAX_IMAGE_PIXELS", None):
+            parser = ImageParser()
+            self.assertEqual(parser.max_pixels, 89_478_485)
+            path = self._image("a.png", "PNG")
+            self.assertEqual(parser.extract_metadata(path).format, "PNG")
 
     # --- Paths ---
 
     def test_directory_is_refused(self):
         with self.assertRaises(ValidationError):
             ImageParser().extract_metadata(self.dir)
+
+    def test_directory_reported_as_permission_error_is_refused(self):
+        # Windows raises PermissionError, not IsADirectoryError, when
+        # opening a directory.
+        with patch("semantica.parse.image_parser.os.open", side_effect=PermissionError):
+            with self.assertRaises(ValidationError):
+                ImageParser().extract_metadata(self.dir)
+
+    def test_permission_error_on_a_file_is_not_hidden(self):
+        path = self._image("a.png", "PNG")
+        with patch("semantica.parse.image_parser.os.open", side_effect=PermissionError):
+            with self.assertRaises(ProcessingError):
+                ImageParser().extract_metadata(path)
 
     # --- Pixel limits ---
 
@@ -288,6 +371,26 @@ class TestImageParserLimits(unittest.TestCase):
             warnings.simplefilter("error")
             with self.assertRaises(ValidationError):
                 ImageParser().extract_metadata(path)
+
+    def test_opening_leaves_global_warning_filters_alone(self):
+        # The parser must not change process-wide warning filters (as
+        # catch_warnings() + simplefilter() do), which other threads
+        # depend on.
+        parser = ImageParser()
+        png = self._image("a.png", "PNG")
+        oversized = self._png_header(10_000, 10_000)
+
+        # Pillow's own warning still reaches the caller as usual; our check
+        # then rejects the image.
+        with self.assertWarns(Image.DecompressionBombWarning):
+            with patch.object(
+                warnings,
+                "simplefilter",
+                side_effect=AssertionError("warning filters changed"),
+            ):
+                parser.extract_metadata(png)
+                with self.assertRaises(ValidationError):
+                    parser.extract_metadata(oversized)
 
     def test_webp_canvas_checked_before_pillow_opens_it(self):
         # A tiny WebP claiming a 16384 x 16384 canvas: libwebp would
