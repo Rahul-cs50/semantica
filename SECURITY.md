@@ -2,17 +2,17 @@
 
 ## Supported Versions
 
-We actively support the following versions of Semantica with security updates:
+Security updates go to the latest release line. Older lines do not get fixes;
+upgrade to the latest release to receive them.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.2.3   | :white_check_mark: |
-| 0.2.2   | :white_check_mark: |
-| 0.2.1   | :white_check_mark: |
-| 0.2.0   | :white_check_mark: |
-| 0.1.1   | :white_check_mark: |
-| 0.1.0   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+| Version | Python      | Supported          |
+| ------- | ----------- | ------------------ |
+| 0.8.x   | 3.11 – 3.13 | :white_check_mark: |
+| < 0.8   | 3.10 – 3.13 | :x:                |
+
+0.7.x is the last line that installs on Python 3.10, so Python 3.10 users
+receive no further fixes, including the Pillow 13 security fixes, which need
+Python 3.11. See the 0.8.0 entry in the CHANGELOG.
 
 ## Reporting a Vulnerability
 

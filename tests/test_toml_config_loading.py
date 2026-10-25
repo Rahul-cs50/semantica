@@ -6,7 +6,13 @@ third-party ``tomli`` backport, which Semantica never declared. On Python
 inside ``_load_from_file``, was logged and ignored, and the settings were
 silently dropped. Python 3.11 is now the floor, so all four config classes
 use the stdlib ``tomllib``.
+
+CI's pinned environment has ``tomli`` installed (coverage pulls it in), which
+would hide a regression back to ``import tomli``, so the test blocks that
+import for every case.
 """
+
+import sys
 
 import pytest
 
@@ -25,7 +31,9 @@ from semantica.visualization.config import VisualizationConfig
         (VisualizationConfig, "visualization"),
     ],
 )
-def test_toml_config_file_is_applied(tmp_path, config_cls, section):
+def test_toml_config_file_is_applied(tmp_path, monkeypatch, config_cls, section):
+    # A None entry in sys.modules makes `import tomli` raise ImportError.
+    monkeypatch.setitem(sys.modules, "tomli", None)
     config_file = tmp_path / "semantica.toml"
     config_file.write_text(f'[{section}]\ntoml_probe = "from-toml"\n', encoding="utf-8")
 

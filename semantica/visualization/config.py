@@ -96,8 +96,8 @@ class VisualizationConfig:
                     if config_data and "visualization" in config_data:
                         self._config.update(config_data["visualization"])
             elif file_path.suffix == ".toml":
-                # stdlib since 3.11, the supported floor. The tomli backport was
-                # never a declared dependency, so .toml files were ignored on 3.11+.
+                # stdlib since 3.11, the supported floor, so the old tomli -> tomllib
+                # fallback is no longer needed.
                 import tomllib
 
                 with open(file_path, "rb") as f:
