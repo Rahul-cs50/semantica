@@ -89,6 +89,7 @@ def test_dev_tooling_is_a_dependency_group_not_a_runtime_extra(pyproject):
     [
         ((3, 8, 18), "fail"),
         ((3, 9, 21), "fail"),
+        # 3.10 has failed since 0.8.0, which moved the floor to 3.11 (#2067).
         ((3, 10, 18), "fail"),
         ((3, 11, 0), "ok"),
         ((3, 13, 9), "ok"),
