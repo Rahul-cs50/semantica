@@ -59,6 +59,9 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
 
 # Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
@@ -1759,7 +1762,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -5686,7 +5692,13 @@ def backup_create(
             _warn_skipped(cli_ctx, skipped)
             if fail_on_skip:
                 _raise_on_skipped(skipped, target="in the archive")
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -5858,7 +5870,7 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
             _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:
