@@ -188,3 +188,25 @@ reason = "pillow 12.3.0 in uv.lock for Python 3.10 only; 13.0.0 needs 3.11+. See
 # nothing left to ignore here. See integrations/crewai/README.md for how to
 # use the CrewAI integration with a manually installed crewai.
 # ---------------------------------------------------------------------------
+
+# filelock 3.32.7: GHSA-v4x8-3wr5-3wq8 (HIGH), GHSA-567q-5qvw-pf92 and
+# GHSA-9vhv-jxww-xfm5 (LOW), fixed in 4.2.1. requirements-ci.txt, the
+# .github/requirements files and uv.lock on Python 3.11+ are on 4.2.4, but on
+# Python 3.10 uv.lock keeps 3.32.7 because snowflake-connector-python 4.x (the
+# last line that installs on 3.10) caps filelock<4. These IDs cover only that
+# entry; they go away when 3.10 support is dropped. See SECURITY.md and #2067.
+
+[[IgnoredVulns]]
+id = "GHSA-v4x8-3wr5-3wq8"
+ignoreUntil = 2027-01-21
+reason = "filelock 3.32.7 in uv.lock for Python 3.10 only; 4.2.4 needs snowflake 5.x, which needs 3.11+. See #2067."
+
+[[IgnoredVulns]]
+id = "GHSA-567q-5qvw-pf92"
+ignoreUntil = 2027-01-21
+reason = "filelock 3.32.7 in uv.lock for Python 3.10 only; 4.2.4 needs snowflake 5.x, which needs 3.11+. See #2067."
+
+[[IgnoredVulns]]
+id = "GHSA-9vhv-jxww-xfm5"
+ignoreUntil = 2027-01-21
+reason = "filelock 3.32.7 in uv.lock for Python 3.10 only; 4.2.4 needs snowflake 5.x, which needs 3.11+. See #2067."

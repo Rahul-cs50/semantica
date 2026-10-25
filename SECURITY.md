@@ -274,6 +274,25 @@ keeps a 12.3.0 resolution for `python_full_version < '3.11'`.
   (<https://devguide.python.org/versions/>), and the 28 IDs in
   `osv-scanner.toml` are accepted until 2027-01-21. Tracked in #2067.
 
+#### filelock 3.32.7 on Python 3.10
+
+filelock 4.2.1 fixes GHSA-v4x8-3wr5-3wq8 (HIGH) and GHSA-567q-5qvw-pf92 and
+GHSA-9vhv-jxww-xfm5 (both LOW). On Python 3.11 and newer, `uv.lock` resolves
+filelock 4.2.4. On Python 3.10 it stays on 3.32.7, because the only
+snowflake-connector-python releases that install on 3.10 (4.x) cap
+`filelock<4`; snowflake-connector-python 5.x, which drops filelock, needs 3.11.
+
+- **Scope**: Python 3.10 `uv sync` installs only. Every requirements file that
+  pins filelock has it at 4.2.4.
+- **Exposure**: the HIGH advisory is in `ReadWriteLock`, and the two LOW ones
+  are in `ReadWriteLock` and `SoftFileLock` on Windows. Semantica does not
+  import filelock. Of its dependencies, torch, transformers, virtualenv and
+  python-discovery use only `FileLock`, and huggingface-hub also uses
+  `SoftFileLock`. None of them uses `ReadWriteLock`.
+- **Revisit**: removed together with the Pillow entry above when Python 3.10
+  support is dropped. The 3 IDs in `osv-scanner.toml` are accepted until
+  2027-01-21. Tracked in #2067.
+
 ## Best Practices for Users
 
 1. **Keep Semantica Updated**: Always use the latest stable version
