@@ -102,8 +102,7 @@ llm-novita = ["openai>=1.0.0"]
 llm-litellm = ["litellm>=1.83.9"]
 llm-instructor = ["instructor>=1.15.3"]
 # Jev is early-access, so keep the integration on the reviewed 0.7 response
-# contract until compatibility with a newer minor line is verified. (The old
-# python_version >= '3.10' marker went with the 3.11 floor; it was always true.)
+# contract until compatibility with a newer minor line is verified.
 llm-typesafe = ["typesafe-sdk>=0.7.0,<0.8.0"]
 
 llm-all = [
