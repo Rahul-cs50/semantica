@@ -562,12 +562,12 @@ def test_result_round_trips_as_decision_provenance():
     assert restored.metadata["typesafe_jev"]["probabilities"]["approve"] == 0.91
 
 
-def test_pyproject_guards_sdk_on_python_310_and_includes_aggregate_extra():
+def test_pyproject_pins_reviewed_sdk_line_and_includes_aggregate_extra():
     pyproject = toml.load(Path(__file__).resolve().parents[1] / "pyproject.toml")
     extras = pyproject["project"]["optional-dependencies"]
 
     assert extras["llm-typesafe"] == [
-        "typesafe-sdk>=0.7.0,<0.8.0; python_version >= '3.10'"
+        "typesafe-sdk>=0.7.0,<0.8.0"
     ]
     assert "llm-typesafe" in extras["llm-all"][0]
 
