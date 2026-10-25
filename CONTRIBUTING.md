@@ -197,7 +197,8 @@ pip install -e . --group dev
 pre-commit install
 ```
 
-Semantica supports Python **3.10–3.13** (`requires-python = ">=3.10,<3.14"`).
+Semantica supports Python **3.11–3.13** (`requires-python = ">=3.11,<3.14"`). Python 3.10
+support ended in 0.8.0; see the CHANGELOG.
 CI runs on 3.11 and the Install Matrix covers the whole range.
 
 #### Reproducible environment with uv (recommended)
@@ -206,10 +207,10 @@ The repository commits a `uv.lock`, so `uv` can build the exact same
 environment for every contributor:
 
 ```bash
-pip install uv==0.12.1        # same version CI uses
+pip install uv==0.13.4        # same version CI uses (.github/requirements/uv-tool.txt)
 uv sync                       # creates .venv from uv.lock, including the `dev` group
 uv sync --extra explorer      # add whichever extras you are working on
-uv sync --python 3.11         # match CI's interpreter (any of 3.10-3.13 works)
+uv sync --python 3.11         # match CI's interpreter (any of 3.11-3.13 works)
 uv run pytest tests/
 ```
 

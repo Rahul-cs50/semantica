@@ -236,62 +236,19 @@ Some dependency advisories cannot be fixed from inside this repository. Each
 one is recorded here with what it affects and when to revisit it, and its IDs
 are accepted in `osv-scanner.toml`.
 
-#### Pillow 12.3.0 on Python 3.10
+#### opentelemetry-api 1.43.0
 
-Pillow 13.0.0 fixes 28 advisories against 12.3.0, 19 of which also appear as
-Dependabot alerts: heap overflows and a use-after-free in the TIFF save path, a
-heap overflow in the JPEG decoder reached through `draft()` and `thumbnail()`,
-unbounded recursion over the PDF page tree, and an argument injection in the
-Ghostscript call. Pillow 13 requires Python 3.11 or newer,
-while Semantica still declares `requires-python = ">=3.10,<3.14"`, so `uv.lock`
-keeps a 12.3.0 resolution for `python_full_version < '3.11'`.
+GHSA-xcq7-p3pf-p88h (CVE-2026-114603): `TraceState.from_header` parses an
+inbound W3C `tracestate` header in quadratic time. It is fixed in 1.45.1, but
+every google-adk release caps `opentelemetry-api<=1.44`, and semgrep (a
+security-scan tool) pins `~=1.37.0`.
 
-- **Scope**: Python 3.10 installs only. Every requirements file that pins
-  pillow has it at 13.0.0, which carries no advisories.
-- **Exposure through images**: `ImageParser` passes caller-supplied bytes to
-  `PIL.Image.open()`. Since #2079 its defaults accept only PNG, JPEG, WebP and
-  BMP, which keeps the TIFF, PDF, GIF, EPS, MSP and XBM advisories out of
-  reach. GHSA-5xm2 (APNG canvas allocation) is reachable with those defaults,
-  and widening `allowed_formats` widens the exposure.
-- **Exposure through documents**: `DoclingParser` takes image files directly
-  and parses DOCX, PPTX and HTML with embedded images, and docling opens those
-  with every Pillow plugin enabled, so `ImageParser`'s allowlist does not
-  constrain it (inferred from docling's source, see #2067). `pdf_parser` goes
-  through pdfplumber and `pptx_parser` through python-pptx, both Pillow-backed.
-  Text and JSON parsing do not touch Pillow, and neither do images the
-  application produces itself.
-- **Mitigation**: none within 12.x, because no patched 12.x exists. Running on
-  Python 3.11 or newer installs Pillow 13.
-- **Cost of dropping 3.10**, measured on 2026-10-23: `uv.lock` loses 1,585
-  lines, 12 packages drop their 3.10-only variant, and five disappear entirely
-  (`backports-asyncio-runner`, `coloredlogs`, `exceptiongroup`,
-  `humanfriendly`, `pyreadline3`). No package changes version on 3.11+. Beyond
-  the lock it is `requires-python`, one classifier, the Install Matrix, the
-  README badge, and about eleven lines of documentation.
-- **Downloads on 3.10**: 9.9% (5,403 of 54,434) between 2026-09-18 and
-  2026-10-22, from pypistats `python_minor`.
-- **Revisit**: Python 3.10 reached end of life on 2026-10-01
-  (<https://devguide.python.org/versions/>), and the 28 IDs in
-  `osv-scanner.toml` are accepted until 2027-01-21. Tracked in #2067.
-
-#### filelock 3.32.7 on Python 3.10
-
-filelock 4.2.1 fixes GHSA-v4x8-3wr5-3wq8 (HIGH) and GHSA-567q-5qvw-pf92 and
-GHSA-9vhv-jxww-xfm5 (both LOW). On Python 3.11 and newer, `uv.lock` resolves
-filelock 4.2.4. On Python 3.10 it stays on 3.32.7, because the only
-snowflake-connector-python releases that install on 3.10 (4.x) cap
-`filelock<4`; snowflake-connector-python 5.x, which drops filelock, needs 3.11.
-
-- **Scope**: Python 3.10 `uv sync` installs only. Every requirements file that
-  pins filelock has it at 4.2.4.
-- **Exposure**: the HIGH advisory is in `ReadWriteLock`, and the two LOW ones
-  are in `ReadWriteLock` and `SoftFileLock` on Windows. Semantica does not
-  import filelock. Of its dependencies, torch, transformers, virtualenv and
-  python-discovery use only `FileLock`, and huggingface-hub also uses
-  `SoftFileLock`. None of them uses `ReadWriteLock`.
-- **Revisit**: removed together with the Pillow entry above when Python 3.10
-  support is dropped. The 3 IDs in `osv-scanner.toml` are accepted until
-  2027-01-21. Tracked in #2067.
+- **Exposure**: Semantica never imports opentelemetry, its google-adk
+  integration runs no HTTP server, and the semgrep CLI handles no inbound
+  requests, so no inbound `tracestate` header is parsed.
+- **Revisit**: when google-adk allows 1.45.1. Accepted until 2027-01-23 in
+  `osv-scanner.toml` and in `IGNORED_VULN_IDS` in
+  `.github/workflows/security-scan.yml`.
 
 ## Best Practices for Users
 

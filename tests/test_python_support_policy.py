@@ -24,7 +24,7 @@ def pyproject():
 
 
 def _range(requires_python: str):
-    """Parse ``>=3.10,<3.14`` into ``((3, 10), (3, 14))``."""
+    """Parse ``>=3.11,<3.14`` into ``((3, 11), (3, 14))``."""
     floor = re.fullmatch(r".*>=\s*(\d+)\.(\d+)(?:\.\d+)?.*", requires_python)
     ceiling = re.fullmatch(r".*<\s*(\d+)\.(\d+)(?:\.\d+)?.*", requires_python)
     assert floor and ceiling, (
@@ -89,7 +89,8 @@ def test_dev_tooling_is_a_dependency_group_not_a_runtime_extra(pyproject):
     [
         ((3, 8, 18), "fail"),
         ((3, 9, 21), "fail"),
-        ((3, 10, 0), "ok"),
+        ((3, 10, 18), "fail"),
+        ((3, 11, 0), "ok"),
         ((3, 13, 9), "ok"),
         ((3, 14, 0), "warn"),
     ],
@@ -99,4 +100,4 @@ def test_doctor_python_check(version, status):
     assert got == status
     assert (hint is None) == (status == "ok")
     if status == "fail":
-        assert "3.10" in hint
+        assert "3.11" in hint

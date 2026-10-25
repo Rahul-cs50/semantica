@@ -60,9 +60,9 @@ if TYPE_CHECKING:
 
 console = Console()
 
-# Supported interpreter range: ``requires-python = ">=3.10,<3.14"`` in
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
-MIN_PYTHON = (3, 10)
+MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)
 
 

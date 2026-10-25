@@ -101,10 +101,10 @@ class GraphStoreConfig:
                     if config_data and "graph_store" in config_data:
                         self._config.update(config_data["graph_store"])
             elif file_path.suffix == ".toml":
-                import tomli
+                import tomllib
 
                 with open(file_path, "rb") as f:
-                    config_data = tomli.load(f)
+                    config_data = tomllib.load(f)
                     if config_data and "graph_store" in config_data:
                         self._config.update(config_data["graph_store"])
         except Exception as e:
