@@ -85,7 +85,7 @@ COPY --from=frontend-builder /app/semantica/static ./semantica/static
 # --require-hashes fails outright rather than silently under-pinning).
 # Every fetched package is hash-verified (Scorecard Pinned-Dependencies)
 # and pinned to the same versions CI audited, e.g. msgpack==1.2.1 and
-# setuptools==84.0.0 (which also replaces the base image's vulnerable
+# setuptools==84.2.1 (which also replaces the base image's vulnerable
 # 70.3.0, CVE-2025-47273 - nothing else in the tree pulls a newer copy).
 # --no-deps on the local package itself: it's our own source tree, not a
 # fetch, so there's nothing to hash-pin there - but `pip install .` still

@@ -266,7 +266,7 @@ version: a minimal bump tends to land just inside the range of the next
 advisory. Regenerate with `--upgrade-package <name>` so other pins stay put.
 
 Build-system pins: `[build-system].requires` is pinned to exact versions
-(`setuptools==84.0.0`, `wheel==0.48.0`) and release builds run
+(`setuptools==84.2.1`, `wheel==0.48.0`) and release builds run
 `python -m build --no-isolation` against the lockfile — no unpinned
 build-time isolation anywhere.
 
