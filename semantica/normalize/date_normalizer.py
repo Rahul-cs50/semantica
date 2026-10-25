@@ -299,7 +299,8 @@ class TimeZoneNormalizer:
                 datetime_obj = datetime_obj.replace(tzinfo=timezone.utc)
             return datetime_obj.astimezone(target_tz)
         except Exception:
-            # Fallback if zoneinfo not available
+            # zoneinfo is always available (stdlib on 3.11+). This catches an
+            # unknown or malformed timezone name and returns the input as-is.
             return datetime_obj
 
     def convert_to_utc(
