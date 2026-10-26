@@ -31,6 +31,7 @@ if sys.platform == "win32":
     if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import ast
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -58,10 +59,15 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
 
-# Supported interpreter range: ``requires-python = ">=3.10,<3.14"`` in
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
-MIN_PYTHON = (3, 10)
+# 3.10 was dropped in 0.8.0: it is past end of life and Pillow 13, which has
+# the security fixes 12.x lacks, needs 3.11 (#2067).
+MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)
 
 
@@ -655,8 +661,9 @@ def main(
         # Reinitialize the module-level console if --no-color was requested so
         # all subsequent console.print() calls in this invocation respect the flag.
         if no_color:
-            global console  # noqa: PLW0603
+            global console, err_console  # noqa: PLW0603
             console = Console(no_color=True)
+            err_console = Console(stderr=True, no_color=True)
         ctx.obj = CLIContext(
             config_path=_resolve_config_path(config_path),
             config=config,
@@ -1756,7 +1763,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -4860,6 +4870,73 @@ _PIPELINE_TEMPLATES = [
 ]
 
 
+class PipelineFileError(click.ClickException):
+    """A pipeline file that parses but is not a usable pipeline definition.
+
+    ``errors`` keeps the per-entry messages so ``--json`` can report each
+    offending entry instead of one flattened sentence.
+    """
+
+    def __init__(self, message: str, errors: Optional[List[str]] = None) -> None:
+        super().__init__(message)
+        self.errors = list(errors) if errors else [message]
+
+
+def _pipeline_step_errors(payload: Dict[str, Any]) -> List[str]:
+    """Return an error for every step ``PipelineBuilder`` would silently drop.
+
+    ``PipelineBuilder.build_pipeline`` keeps a step only when both ``name`` and
+    ``type`` are truthy (``pipeline_builder.py`` — ``if step_name and
+    step_type``). Every other entry disappears before the validator sees it, so
+    a partly malformed file used to be reported valid. Check the shape here,
+    while the offending index is still known.
+    """
+    steps = payload.get("steps", [])
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        return [f"'steps' must be a list, got {type(steps).__name__}"]
+    errors: List[str] = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            errors.append(
+                f"steps[{index}] is not a mapping (got {type(step).__name__})"
+            )
+            continue
+        label = f"steps[{index}]"
+        name = step.get("name")
+        if isinstance(name, str) and name.strip():
+            label += f" ('{name}')"
+        for field_name in ("name", "type"):
+            value = step.get(field_name)
+            if not (isinstance(value, str) and value.strip()):
+                errors.append(
+                    f"{label} is missing a non-empty '{field_name}'"
+                )
+    return errors
+
+
+def _pipeline_builder_error_messages(exc: BaseException) -> List[str]:
+    """Split the builder's ``Pipeline validation failed: [...]`` message.
+
+    ``PipelineBuilder.build_pipeline`` raises one ``ValidationError`` whose
+    message embeds the list of validation errors as a Python literal, so a
+    ``--json`` caller that only got that string would have to parse it back.
+    """
+    detail = str(exc)
+    prefix = "Pipeline validation failed: "
+    if detail.startswith(prefix):
+        detail = detail[len(prefix):]
+    if detail.startswith("[") and detail.endswith("]"):
+        try:
+            parsed = ast.literal_eval(detail)
+        except (ValueError, SyntaxError):
+            return [detail]
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    return [detail]
+
+
 def _load_pipeline_file(path: str) -> Any:
     """Load a pipeline config file into a ``Pipeline`` object.
 
@@ -4877,9 +4954,15 @@ def _load_pipeline_file(path: str) -> Any:
     except yaml.YAMLError as exc:
         raise click.ClickException(f"Could not parse {path} as YAML: {exc}") from exc
     if not isinstance(payload, dict):
-        raise click.ClickException(
+        raise PipelineFileError(
             f"{path} is not a pipeline definition: expected a mapping with a "
             f"'steps' list, got {type(payload).__name__}."
+        )
+    step_errors = _pipeline_step_errors(payload)
+    if step_errors:
+        raise PipelineFileError(
+            f"{path} is not a valid pipeline definition: " + "; ".join(step_errors),
+            errors=step_errors,
         )
     return PipelineSerializer().deserialize_pipeline(payload)
 
@@ -4930,36 +5013,75 @@ def pipeline_validate(cli_ctx: CLIContext, pipeline_file: str, local_json: bool)
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
-        pipeline = _load_pipeline_file(pipeline_file)
+        # --json promises its own {valid, errors, warnings, pipeline} object, so a
+        # file the loader (or the builder inside it) rejects must still be reported
+        # in that shape instead of falling through to the generic error envelope.
+        json_mode = _is_json(cli_ctx, local_json)
+        errors: List[str] = []
+        warnings_found: List[str] = []
+        pipeline = None
         try:
-            from .pipeline import PipelineValidator
-        except ImportError as exc:
-            raise click.ClickException(f"Pipeline module not available: {exc}") from exc
-        # The old wrapper passed the file path straight to validate(). A str has no
-        # steps, so it type-checked nothing and reported valid for any input.
-        result = PipelineValidator().validate(pipeline)
-        errors = [str(e) for e in (getattr(result, "errors", None) or [])]
-        warnings_found = [str(w) for w in (getattr(result, "warnings", None) or [])]
-        if _is_json(cli_ctx, local_json):
+            pipeline = _load_pipeline_file(pipeline_file)
+        except PipelineFileError as exc:
+            if not json_mode:
+                raise
+            errors = exc.errors
+        except click.ClickException as exc:
+            if not json_mode:
+                raise
+            errors = [str(exc.format_message())]
+        except SemanticaError as exc:  # the builder rejected the payload
+            if not json_mode:
+                raise
+            errors = _pipeline_builder_error_messages(exc)
+        except Exception as exc:  # malformed in some way we did not anticipate
+            if not json_mode:
+                raise
+            errors = [str(exc)]
+
+        if pipeline is not None:
+            try:
+                from .pipeline import PipelineValidator
+            except ImportError as exc:
+                raise click.ClickException(
+                    f"Pipeline module not available: {exc}"
+                ) from exc
+            # The old wrapper passed the file path straight to validate(). A str has
+            # no steps, so it type-checked nothing and reported valid for any input.
+            result = PipelineValidator().validate(pipeline)
+            errors = [str(e) for e in (getattr(result, "errors", None) or [])]
+            warnings_found = [
+                str(w) for w in (getattr(result, "warnings", None) or [])
+            ]
+            valid = bool(getattr(result, "valid", False))
+        else:
+            valid = False
+
+        if json_mode:
             _jecho({
-                "valid": bool(getattr(result, "valid", False)),
+                "valid": valid,
                 "errors": errors,
                 "warnings": warnings_found,
                 "pipeline": pipeline_file,
             })
-        elif not getattr(result, "valid", False):
+            if not valid:
+                # Text mode already exits non-zero on an invalid file; JSON mode
+                # used to return 0, so callers had to parse the body to notice.
+                raise SystemExit(1)
+            return
+
+        if not valid:
             for err in errors:
                 _warn(cli_ctx, err)
             raise click.ClickException(
                 f"Pipeline config invalid: {pipeline_file} "
                 f"({len(errors)} error(s), {len(warnings_found)} warning(s))"
             )
-        else:
-            _ok(
-                cli_ctx,
-                f"Pipeline config valid: {pipeline_file} "
-                f"({len(warnings_found)} warning(s))",
-            )
+        _ok(
+            cli_ctx,
+            f"Pipeline config valid: {pipeline_file} "
+            f"({len(warnings_found)} warning(s))",
+        )
 
     _run_with_error_handling(_action)
 
@@ -5364,9 +5486,9 @@ def _collect_backup_sources(
 ) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
     """Return (arcname, local_path) pairs for local files to include in a backup.
 
-    Also returns each configured store whose local path does not exist, so the
-    caller can report it instead of writing a partial archive with no sign that
-    a store was dropped (#2009).
+    Also returns each configured store whose local path does not exist or holds
+    no files, so the caller can report it instead of writing a partial archive
+    with no sign that a store was dropped (#2009, #2014).
     """
     sources: List[Tuple[str, Path]] = []
     skipped: List[Dict[str, str]] = []
@@ -5385,11 +5507,26 @@ def _collect_backup_sources(
         if ont_path:
             p = Path(ont_path)
             if p.is_dir():
+                before = len(sources)
                 for f in p.rglob("*"):
                     if f.is_file():
                         sources.append((f"ontology/{f.relative_to(p)}", f))
+                if len(sources) == before:
+                    # An existing-but-empty directory contributed nothing; report
+                    # it instead of dropping it silently (#2014).
+                    skipped.append({
+                        "store": "ontology",
+                        "backend": "file",
+                        "path": _redact(ont_path),
+                    })
             elif p.is_file():
                 sources.append((f"ontology/{p.name}", p))
+            else:
+                skipped.append({
+                    "store": "ontology",
+                    "backend": "file",
+                    "path": _redact(ont_path),
+                })
 
     store_map = {"graph": "graph_db", "vector": "vector_store", "triplet": "triplet_store"}
     for store_type, cfg_key in store_map.items():
@@ -5407,9 +5544,19 @@ def _collect_backup_sources(
             continue
         p = Path(data_path)
         if p.is_dir():
+            before = len(sources)
             for f in p.rglob("*"):
                 if f.is_file():
                     sources.append((f"{store_type}/{f.relative_to(p)}", f))
+            if len(sources) == before:
+                # Same reporting rule as a missing path: an empty directory
+                # yields no files, so the store would vanish from the archive
+                # with no sign of it (#2014).
+                skipped.append({
+                    "store": store_type,
+                    "backend": str(info.get("backend", "unknown")),
+                    "path": _redact(data_path),
+                })
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
         else:
@@ -5422,6 +5569,33 @@ def _collect_backup_sources(
             })
 
     return sources, skipped
+
+
+def _skip_label(store: str) -> str:
+    """Human label for a skipped entry, without calling ontology a 'store'."""
+    return "ontology" if store == "ontology" else f"{store} store"
+
+
+def _warn_skipped(cli_ctx: CLIContext, skipped: List[Dict[str, str]]) -> None:
+    """Name every configured path that contributed no files (#2009, #2014)."""
+    for entry in skipped:
+        _warn(
+            cli_ctx,
+            f"Skipping {_skip_label(entry['store'])} ({entry['backend']}): "
+            f"path does not exist or contains no files: {entry['path']}",
+        )
+
+
+def _raise_on_skipped(skipped: List[Dict[str, str]], *, target: str) -> None:
+    """Raise the --fail-on-skip error naming every skipped path."""
+    if not skipped:
+        return
+    missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
+    raise click.ClickException(
+        f"Configured store path does not exist or contains no files: {missing}. "
+        f"Nothing from those stores would be {target}; create the path, drop it "
+        "from the config, or omit --fail-on-skip to continue with the rest."
+    )
 
 
 def _redact(uri: str) -> str:
@@ -5490,7 +5664,7 @@ def backup_info(cli_ctx: CLIContext, local_json: bool) -> None:
 @click.option("--strip-config", is_flag=True, default=False,
               help="Exclude semantica.yaml to avoid storing credentials at rest.")
 @click.option("--fail-on-skip", is_flag=True, default=False,
-              help="Exit non-zero when a configured store path does not exist.")
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
@@ -5510,7 +5684,22 @@ def backup_create(
 
     def _action() -> None:
         if _is_dry(cli_ctx, local_dry):
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            # A dry run is a preview of the real command, so it has to report
+            # the same skipped stores and honour --fail-on-skip (#2109).
+            cfg = cli_ctx.config.to_dict()
+            _, skipped = _collect_backup_sources(
+                cfg, cli_ctx.config_path, include, strip_config,
+            )
+            _warn_skipped(cli_ctx, skipped)
+            if fail_on_skip:
+                _raise_on_skipped(skipped, target="in the archive")
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -5543,12 +5732,7 @@ def backup_create(
         # so a partial archive was reported as a success (#2009). Report every
         # one before the prompts, and before the empty-archive check below so
         # the missing paths are named even when no store is left to back up.
-        for entry in skipped:
-            _warn(
-                cli_ctx,
-                f"Skipping {entry['store']} store ({entry['backend']}): "
-                f"path does not exist: {entry['path']}",
-            )
+        _warn_skipped(cli_ctx, skipped)
 
         # Fail before any prompt instead of writing an archive with no
         # store data in it (#1820).
@@ -5564,13 +5748,8 @@ def backup_create(
                 "to see how to back up other backends."
             )
 
-        if skipped and fail_on_skip:
-            missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
-            raise click.ClickException(
-                f"Configured store path does not exist: {missing}. Nothing from "
-                "those stores would be in the archive; create the path, drop it "
-                "from the config, or omit --fail-on-skip to back up the rest."
-            )
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="in the archive")
 
         if encrypt and passphrase is None:
             passphrase = click.prompt("Backup passphrase", hide_input=True,
@@ -5662,11 +5841,13 @@ def backup_create(
 @click.option("--include",
               type=click.Choice(["graph", "vector", "triplet", "config", "ontology", "all"]),
               default="all", show_default=True)
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
-                local_dry: bool, local_quiet: bool) -> None:
+                fail_on_skip: bool, local_dry: bool, local_quiet: bool) -> None:
     """Incremental folder sync (idempotent, copies only changed files).
 
     \b
@@ -5680,12 +5861,17 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
         import shutil
         dest = Path(destination)
         cfg = cli_ctx.config.to_dict()
-        sources, _skipped = _collect_backup_sources(
+        sources, skipped = _collect_backup_sources(
             cfg, cli_ctx.config_path, include, strip_config=False,
         )
+        # A skipped store used to be discarded here, so a sync after a partial
+        # create reported success for an incomplete store set (#2014).
+        _warn_skipped(cli_ctx, skipped)
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:
