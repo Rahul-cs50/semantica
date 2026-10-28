@@ -785,9 +785,39 @@ def test_grouping_is_complete_linkage_not_transitive():
     assert len(_detector().detect_value_conflicts(rows, "completed")) == 1
 
 
-def test_a_number_and_its_string_form_are_a_conflict():
-    """Declared behaviour change: type disagreement counts."""
-    assert len(_detector().detect_value_conflicts(_pair(640.0, "640.0"), "completed")) == 1
+def test_a_number_and_its_string_form_are_the_same_value():
+    """CSV sources read every value as a string, so the two spellings must agree."""
+    assert _detector().detect_value_conflicts(_pair(640, "640"), "completed") == []
+    assert _detector().detect_value_conflicts(_pair(640.0, "640.0"), "completed") == []
+
+
+def test_a_string_that_spells_the_number_differently_is_a_conflict():
+    # Strings are still compared exactly: "640.000" is not what 640.0 spells.
+    assert len(_detector().detect_value_conflicts(_pair(640.0, "640.000"), "completed")) == 1
+
+
+def test_zero_tolerance_still_matches_a_number_and_its_string_form():
+    assert _detector(numeric_tolerance=0).detect_value_conflicts(_pair(640, "640"), "completed") == []
+
+
+def test_a_large_integer_and_its_string_form_are_the_same_value():
+    huge = 2**53 + 1
+
+    assert _detector().detect_value_conflicts(_pair(huge, str(huge)), "completed") == []
+
+
+def test_two_infinities_are_the_same_value():
+    assert _detector().detect_value_conflicts(_pair(float("inf"), float("inf")), "completed") == []
+    assert _detector().detect_value_conflicts(_pair(float("-inf"), float("-inf")), "completed") == []
+
+
+def test_opposite_infinities_are_a_conflict():
+    assert len(_detector().detect_value_conflicts(_pair(float("-inf"), float("inf")), "completed")) == 1
+
+
+def test_an_infinity_never_matches_a_finite_value():
+    assert len(_detector().detect_value_conflicts(_pair(float("inf"), 640.0), "completed")) == 1
+    assert len(_detector().detect_value_conflicts(_pair(float("-inf"), 640.0), "completed")) == 1
 
 
 def test_int_and_float_of_the_same_value_are_equal():

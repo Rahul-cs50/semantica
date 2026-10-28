@@ -98,66 +98,74 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _within(left: float, right: float, tolerance: float) -> bool:
-    """Absolute difference, for two finite floats."""
-    return abs(left - right) <= tolerance
+def _finite_float(value: Any) -> Optional[float]:
+    """The value as a float when float arithmetic keeps it exact, else ``None``.
+
+    ``None`` for anything that cannot be compared by difference: values that are
+    not numbers, NaN and the infinities, and integers beyond 2**53, where two
+    distinct values map to the same float. Integers outside the float range
+    therefore cannot raise either.
+    """
+    if not _is_number(value):
+        return None
+    if isinstance(value, int) and abs(value) > 2**53:
+        return None
+    try:
+        as_float = float(value)
+    except OverflowError:
+        return None
+    return as_float if math.isfinite(as_float) else None
+
+
+def _same(left: Any, right: Any, tolerance: Optional[float]) -> bool:
+    """Whether two values count as the same value.
+
+    Matching string forms is the first rule, and it is the rule the detector
+    used before the tolerance existed: 640 and "640" are the same value, and so
+    are two NaNs or two infinities. Only with a positive ``tolerance``, and only
+    when float arithmetic can carry both, are two numbers closer than it also
+    the same.
+    """
+    if str(left) == str(right):
+        return True
+    if not tolerance:
+        return False
+    left_float = _finite_float(left)
+    right_float = _finite_float(right)
+    if left_float is None or right_float is None:
+        return False
+    return abs(left_float - right_float) <= tolerance
 
 
 def _distinct_values(values: List[Any], tolerance: Optional[float]) -> List[Any]:
-    """Return one key per distinct value, comparing finite numbers by difference.
+    """Return one key per distinct value.
 
-    Two finite numbers are the same when ``abs(a - b) <= tolerance``. Grouping
-    is complete-linkage: every pair inside a group satisfies it, which matters
-    because the relation is not transitive (0, 0.8e-9 and 1.6e-9 with a 1e-9
-    tolerance form two groups, not one).
+    Two values are the same when their string forms match, so a number and the
+    string that spells it stay equal, as they were when everything was compared
+    as a string. A positive ``tolerance`` adds one rule on top: two finite
+    numbers that differ by at most it are the same. Grouping is complete-linkage
+    — every pair inside a group is the same — because the tolerance relation is
+    not transitive (0, 0.8e-9 and 1.6e-9 with a 1e-9 tolerance form two groups,
+    not one).
 
-    Values that float arithmetic cannot represent faithfully fall back to exact
-    string comparison: NaN (a parse failure, not a measurement) and integers
-    beyond 2**53, where distinct values map to the same float. Integers outside
-    the float range therefore cannot raise either.
+    NaN, the infinities and integers beyond 2**53 never reach the tolerance
+    comparison, since float arithmetic cannot tell their values apart; they are
+    compared by string form alone. ``None`` is not a value and is skipped.
 
-    Non-numbers are compared by their string form, exactly, and a number and
-    the string that spells it are different values. The old code compared
-    everything as strings, so 640.0 and "640.0" used to match; they no longer
-    do.
-
-    ``tolerance`` of ``None`` or ``0`` means exact comparison for numbers.
+    ``tolerance`` of ``None`` or ``0`` leaves the string comparison alone, which
+    is what the detector did before the tolerance existed.
     """
-    numbers: List[float] = []
-    others: List[str] = []
-
+    groups: List[List[Any]] = []
     for value in values:
         if value is None:
             continue
-        if not _is_number(value):
-            others.append(str(value))
-            continue
-        try:
-            as_float = float(value)
-            if math.isnan(as_float):
-                raise ValueError("NaN is compared as a string")
-            if isinstance(value, int) and abs(value) > 2**53:
-                raise ValueError("integer beyond float precision is compared as a string")
-            numbers.append(as_float)
-        except (OverflowError, ValueError):
-            others.append(str(value))
-
-    groups = 0
-    if numbers:
-        ordered = sorted(numbers)
-        if tolerance and tolerance > 0:
-            groups = 1
-            group_min = ordered[0]
-            for value in ordered[1:]:
-                if not _within(value, group_min, tolerance):
-                    groups += 1
-                    group_min = value
+        for group in groups:
+            if all(_same(value, member, tolerance) for member in group):
+                group.append(value)
+                break
         else:
-            groups = len(set(ordered))
-
-    keys: List[Any] = [("number", index) for index in range(groups)]
-    keys.extend(dict.fromkeys(others))
-    return keys
+            groups.append([value])
+    return [tuple(group) for group in groups]
 
 
 class ConflictDetector:
