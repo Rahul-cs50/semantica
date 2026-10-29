@@ -303,3 +303,24 @@ def test_formatting_paragraph_text_includes_text_box_text(tmp_path):
 
     texts = [p["text"] for p in result["formatting"]["paragraphs"]]
     assert texts == ["BODY_TEXT", "CALLOUT_TEXT"]
+
+
+def test_wrapped_runs_in_a_text_box_are_extracted(tmp_path):
+    # A box paragraph with a tracked insertion, a content control and a
+    # tracked deletion: inserted and controlled text is text, deleted is not.
+    box_paragraph = (
+        "<w:p><w:r><w:t xml:space='preserve'>PLAIN </w:t></w:r>"
+        '<w:ins w:id="1" w:author="A">'
+        "<w:r><w:t xml:space='preserve'>INSERTED </w:t></w:r></w:ins>"
+        "<w:sdt><w:sdtContent><w:r><w:t>CONTROL</w:t></w:r></w:sdtContent></w:sdt>"
+        '<w:del w:id="2" w:author="A">'
+        "<w:r><w:delText>DELETED</w:delText></w:r></w:del>"
+        "</w:p>"
+    )
+    document = docx.Document()
+    document.add_paragraph("BODY_TEXT")
+    _insert_after(document.paragraphs[-1], _paragraph(_vml_box(box_paragraph)))
+
+    result = _parse(document, tmp_path)
+
+    assert _body_lines(result)[-1] == "PLAIN INSERTED CONTROL"

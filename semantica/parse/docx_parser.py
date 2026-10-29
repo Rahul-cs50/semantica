@@ -76,6 +76,27 @@ _MC_FALLBACK = _MC + "Fallback"
 _RUN_TEXT_TAGS = frozenset(
     _W + tag for tag in ("br", "cr", "noBreakHyphen", "ptab", "t", "tab")
 )
+# Elements whose runs are read as paragraph text. `Paragraph.text` reads
+# through hyperlinks only, and body paragraphs keep that. Box paragraphs never
+# went through `Paragraph.text`: they were read from every `w:t` in them, so
+# they also read through insertions, content controls, fields and the like
+# (but not `w:del`, whose text is `w:delText`).
+_BODY_RUN_WRAPPERS = frozenset({_W_HYPERLINK})
+_BOX_RUN_WRAPPERS = frozenset(
+    _W + tag
+    for tag in (
+        "bdo",
+        "customXml",
+        "dir",
+        "fldSimple",
+        "hyperlink",
+        "ins",
+        "moveTo",
+        "sdt",
+        "sdtContent",
+        "smartTag",
+    )
+)
 
 
 def _text_boxes(element):
@@ -114,12 +135,12 @@ def _box_paragraphs(box):
             yield paragraph
 
 
-def _paragraph_lines(p) -> List[str]:
+def _paragraph_lines(p, wrappers=_BODY_RUN_WRAPPERS) -> List[str]:
     """The text of the ``w:p`` element ``p``, one line per block, in order.
 
     Run text stays on one line until a text box interrupts it; each paragraph
     of the box then gets its own line(s), and the run text after the box starts
-    a new line.
+    a new line. Runs are read inside ``p`` and inside the ``wrappers`` in it.
     """
     lines: List[str] = []
     pending: List[str] = []
@@ -134,22 +155,23 @@ def _paragraph_lines(p) -> List[str]:
         for box in _text_boxes(element):
             flush()
             for inner in _box_paragraphs(box):
-                lines.extend(_paragraph_lines(inner))
+                lines.extend(_paragraph_lines(inner, _BOX_RUN_WRAPPERS))
 
-    for child in p:
-        runs = [child] if child.tag == _W_R else []
-        if child.tag == _W_HYPERLINK:
-            runs = [r for r in child if r.tag == _W_R]
-        if not runs:
-            # `Paragraph.text` ignores these, but a box can still sit inside.
-            read_boxes(child)
-            continue
-        for run in runs:
-            for item in run:
-                if item.tag in _RUN_TEXT_TAGS:
-                    pending.append(str(item))
-                else:
-                    read_boxes(item)
+    def read_runs(element) -> None:
+        for child in element:
+            if child.tag == _W_R:
+                for item in child:
+                    if item.tag in _RUN_TEXT_TAGS:
+                        pending.append(str(item))
+                    else:
+                        read_boxes(item)
+            elif child.tag in wrappers:
+                read_runs(child)
+            else:
+                # Not read as text, but a box can still sit inside.
+                read_boxes(child)
+
+    read_runs(p)
     flush()
     return lines
 
